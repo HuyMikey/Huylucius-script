@@ -14696,6 +14696,7 @@ end
                     library:Notify("Not in danger - returning to menu")
                     trinket_bot.path_running = false
                     if trinket_bot.cancel_movement then trinket_bot.cancel_movement() end
+
                     pcall(function()
                         rps.Requests.ReturnToMenu:InvokeServer()
                     end)
@@ -15043,9 +15044,65 @@ end
                 end
             end
 
+            -- Game bug: using the menu right after Play loses items. While the spawn ForceField is
+            -- still active, a player inside Critical Distance gets up to 10s to leave:
+            --   * ForceField gone (or never there)  -> menu + hop immediately (no waiting)
+            --   * player left critical distance     -> cancel, keep running normally
+            --   * still there after 10s             -> menu + hop
+            -- Returns true when the caller should hop now, false when the threat went away.
+            trinket_bot.critical_grace_wait = function(player_name, distance)
+                local function has_forcefield()
+                    local character = plr.Character
+                    return character ~= nil
+                        and (FindFirstChildOfClass(character, "ForceField") ~= nil or FindFirstChild(character, "ForceField") ~= nil)
+                end
+
+                local function threat_present()
+                    local character = plr.Character
+                    local bot_hrp = character and FindFirstChild(character, "HumanoidRootPart")
+                    if not bot_hrp then return false end
+                    local critical_distance = Options.CriticalDistance and Options.CriticalDistance.Value or 60
+                    for _, other_player in next, plrs:GetPlayers() do
+                        if other_player ~= plr then
+                            local other_hrp = other_player.Character and FindFirstChild(other_player.Character, "HumanoidRootPart")
+                            if other_hrp and (other_hrp.Position - bot_hrp.Position).Magnitude <= critical_distance then
+                                return true
+                            end
+                        end
+                    end
+                    return false
+                end
+
+                -- Path already moving (ExecutePath really started) or no ForceField: no waiting.
+                local path_started = trinket_bot.start_confirmed_tick ~= nil
+                    and trinket_bot.play_confirmed_time ~= nil
+                    and trinket_bot.start_confirmed_tick >= trinket_bot.play_confirmed_time
+                if path_started or not has_forcefield() then
+                    return true
+                end
+
+                trinket_bot.cancel_movement()
+                library:Notify(string.format("Player %s within %.0f studs but ForceField is active - standing still up to 10s", player_name, distance))
+                local deadline = tick() + 10
+                while tick() < deadline do
+                    if shared and shared.is_unloading then return false end
+                    if trinket_bot.combat_proximity_kicked then return false end
+                    if not has_forcefield() then
+                        library:Notify("ForceField gone - going to menu immediately")
+                        return true
+                    end
+                    if not threat_present() then
+                        library:Notify("Player left critical distance - cancelling serverhop")
+                        return false
+                    end
+                    task.wait(0.05)
+                end
+                return true
+            end
+
             -- Critical distance (players only) usable at any time, not only inside ExecutePath.
             trinket_bot.critical_check = function()
-                if trinket_bot.critical_supervisor_fired or trinket_bot.combat_proximity_kicked then return end
+                if trinket_bot.critical_supervisor_fired or trinket_bot.critical_checking or trinket_bot.combat_proximity_kicked then return end
                 if not (mem:HasItem("botstarted") and mem:GetItem("botstarted") == "true") then return end
                 if Toggles.StayInServer and Toggles.StayInServer.Value then return end
 
@@ -15062,12 +15119,18 @@ end
                         if other_hrp then
                             local distance = (other_hrp.Position - bot_hrp.Position).Magnitude
                             if distance <= critical_distance then
-                                trinket_bot.critical_supervisor_fired = true
-                                trinket_bot.fast_hop = true
-                                trinket_bot.path_running = false
-                                library:Notify(string.format("!! CRITICAL DANGER: Player %s within %.0f studs - immediate serverhop !!", other_player.Name, distance))
+                                trinket_bot.critical_checking = true
+                                local player_name = other_player.Name
                                 task.spawn(function()
-                                    SafeServerhop(string.format("Player %s within %.0f studs so am serverhopping instantly!!! (dangerously close)", other_player.Name, distance))
+                                    local should_hop = trinket_bot.critical_grace_wait(player_name, distance)
+                                    trinket_bot.critical_checking = false
+                                    if not should_hop then return end
+
+                                    trinket_bot.critical_supervisor_fired = true
+                                    trinket_bot.fast_hop = true
+                                    trinket_bot.path_running = false
+                                    library:Notify(string.format("!! CRITICAL DANGER: Player %s within %.0f studs - immediate serverhop !!", player_name, distance))
+                                    SafeServerhop(string.format("Player %s within %.0f studs so am serverhopping instantly!!! (dangerously close)", player_name, distance))
                                 end)
                                 return
                             end
@@ -15119,6 +15182,7 @@ end
                 trinket_bot.point21_loot_active = false
                 trinket_bot.point21_release_grace_until = 0
                 trinket_bot.point21_hold_end_time = 0
+                trinket_bot.kick_ground_gate_index = nil
                 trinket_bot.ice_dragon_combat_tagged = false
                 trinket_bot.ice_dragon_resume_index = nil
                 trinket_bot.current_path_target_index = nil
@@ -15216,6 +15280,18 @@ end
                 -- Moderator gate: if this server shows a moderator notification, hop to another
                 -- server and do NOT path here. Existing moderator handling (combat tag kick,
                 -- lich kick, encounter counter, stay-in-server) is reused unchanged.
+                -- Critical-distance grace wait (ForceField) in progress: hold here until it ends.
+                while trinket_bot.critical_checking and not (shared and shared.is_unloading) do
+                    task.wait(0.05)
+                end
+
+                -- A safety hop (e.g. critical distance right after spawning) is already running:
+                -- do not start pathing/moving while it waits for the menu.
+                if trinket_bot.safe_hop_started or trinket_bot.critical_supervisor_fired then
+                    warn("[TRINKETBOT] Safety serverhop in progress - not starting path")
+                    return
+                end
+
                 trinket_bot.possible_moderator_hop_started = false
                 trinket_bot.start_safety_supervisor()
                 -- Hold the "path running" lock during the short settle wait so a second
@@ -15365,6 +15441,17 @@ end
                         end
                     end
                 end)
+
+                -- Last checkpoint before the bot can move: if a critical-distance ForceField wait started
+                -- while ExecutePath was still setting up, hold still until it is decided.
+                while trinket_bot.critical_checking and not (shared and shared.is_unloading) do
+                    task.wait(0.05)
+                end
+                if trinket_bot.critical_supervisor_fired or trinket_bot.safe_hop_started then
+                    trinket_bot.path_running = false
+                    warn("[TRINKETBOT] Safety serverhop in progress - not starting path")
+                    return
+                end
 
                 if not test_mode then trinket_bot.start_confirmed_tick = tick() end -- danh dau "Start Path da that su chay" cho vong lap xac nhan
 
@@ -16613,7 +16700,8 @@ end
                         end
                     end
 
-                    if kick_after_path and not kick_gate_handled then
+                    if kick_after_path and not kick_gate_handled
+                        and not (trinket_bot.kick_ground_gate_index and i <= trinket_bot.kick_ground_gate_index) then
                         local last_gate_index = nil
                         for j = #trinket_bot.path_points, 1, -1 do
                             if trinket_bot.path_points[j].is_gate_point then
@@ -18153,6 +18241,21 @@ end
                                 end
                             end
 
+                            -- A "Trinkets to Kick On" item picked up at Point 21 (in the air): do NOT gate
+                            -- from here. Walk on to the ground point (23, else 24) and gate from there.
+                            if i == 21 and kick_after_path and not kick_gate_handled then
+                                local ground_index = nil
+                                if trinket_bot.path_points[23] then
+                                    ground_index = 23
+                                elseif trinket_bot.path_points[24] then
+                                    ground_index = 24
+                                end
+                                trinket_bot.kick_ground_gate_index = ground_index
+                                if ground_index then
+                                    library:Notify(string.format("%s picked up at Point 21 - moving to ground point %d before gating", kick_trinket_name, ground_index))
+                                end
+                            end
+
                             completed_wait_point = true
                         end
                     end
@@ -19526,6 +19629,7 @@ end
                             end
 
                             if plr.Character then
+                                trinket_bot.play_confirmed_time = tick()
                                 library:Notify("Play confirmed - character loaded")
                             end
                         end
